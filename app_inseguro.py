@@ -1,96 +1,129 @@
 from flask import Flask, request, jsonify
-import hashlib
+from werkzeug.serving import WSGIRequestHandler
+from werkzeug.security import generate_password_hash, check_password_hash
+import os
+import secrets
 import sqlite3
 
 app = Flask(__name__)
 
-@app.route('/')
+# Use environment variable when available; fallback is generated at startup.
+app.config["SECRET_KEY"] = os.getenv("APP_SECRET_KEY") or secrets.token_urlsafe(32)
+
+DB_PATH = "database.db"
+
+
+@app.after_request
+def add_security_headers(response):
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self'; "
+        "style-src 'self'; "
+        "img-src 'self' data:; "
+        "font-src 'self'; "
+        "connect-src 'self'; "
+        "base-uri 'self'; "
+        "form-action 'self'; "
+        "frame-ancestors 'none'; "
+        "object-src 'none'"
+    )
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+
+    # Avoid leaking framework/version details via the Server response header.
+    response.headers["Server"] = "Server"
+    return response
+
+
+@app.route("/")
 def index():
-    return '''
-    <h1>Aplicação Vulnerável para Testes</h1>
-    <p>Esta aplicação contém vulnerabilidades intencionais para fins educacionais.</p>
-    <h2>Endpoints disponíveis:</h2>
+    return """
+    <h1>Aplicacao Segura para Testes</h1>
+    <p>Versao com melhorias de seguranca para fins educacionais.</p>
+    <h2>Endpoints disponiveis:</h2>
     <ul>
         <li><a href="/login">Login (POST)</a></li>
-        <li><a href="/debug">Debug Info</a></li>
         <li><a href="/api/user/1">API User (ID=1)</a></li>
     </ul>
-    '''
+    """
 
-SECRET_KEY = "minha_senha_secreta_123"
-API_TOKEN = "token_admin_2024"
 
-def hash_password(password):
-
-    return hashlib.md5(password.encode()).hexdigest()
-
-def get_db_connection():
-    conn = sqlite3.connect('database.db')
+def get_db_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
     return conn
 
-def init_db():
+
+def init_db() -> None:
     conn = get_db_connection()
-    conn.execute('''CREATE TABLE IF NOT EXISTS users 
-                    (id INTEGER PRIMARY KEY, 
-                     username TEXT, 
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS users
+                    (id INTEGER PRIMARY KEY,
+                     username TEXT UNIQUE,
                      password TEXT,
-                     role TEXT)''')
-    conn.execute("INSERT INTO users (username, password, role) VALUES (?, ?, ?)",
-                 ('admin', hash_password('admin123'), 'administrator'))
+                     role TEXT)"""
+    )
+
+    admin_user = "admin"
+    admin_password = os.getenv("ADMIN_PASSWORD")
+    if admin_password:
+        conn.execute(
+            "INSERT OR IGNORE INTO users (username, password, role) VALUES (?, ?, ?)",
+            (admin_user, generate_password_hash(admin_password), "administrator"),
+        )
+
     conn.commit()
     conn.close()
 
-@app.route('/login', methods=['POST'])
+
+@app.route("/login", methods=["POST"])
 def login():
-    data = request.get_json()
-    username = data.get('username', '')
-    password = data.get('password', '')
-    
-    query = f"SELECT * FROM users WHERE username='{username}' AND password='{hash_password(password)}'"
-    
+    data = request.get_json(silent=True) or {}
+    username = data.get("username", "")
+    password = data.get("password", "")
+
+    if not username or not password:
+        return jsonify({"status": "error", "message": "Username e password sao obrigatorios"}), 400
+
     conn = get_db_connection()
-    cursor = conn.execute(query)
+    cursor = conn.execute("SELECT id, username, password, role FROM users WHERE username = ?", (username,))
     user = cursor.fetchone()
     conn.close()
-    
-    if user:
 
-        return jsonify({
-            'status': 'success',
-            'message': f'Bem-vindo {user[1]}',
-            'role': user[3],
-            'api_token': API_TOKEN 
-        })
-    return jsonify({'status': 'error', 'message': 'Credenciais inválidas'}), 401
+    if user and check_password_hash(user["password"], password):
+        return jsonify(
+            {
+                "status": "success",
+                "message": f"Bem-vindo {user['username']}",
+                "role": user["role"],
+            }
+        )
 
-@app.route('/api/user/<user_id>')
-def get_user(user_id):
+    return jsonify({"status": "error", "message": "Credenciais invalidas"}), 401
 
-    query = "SELECT * FROM users WHERE id=" + user_id
+
+@app.route("/api/user/<int:user_id>")
+def get_user(user_id: int):
     conn = get_db_connection()
-    cursor = conn.execute(query)
+    cursor = conn.execute("SELECT id, username, role FROM users WHERE id = ?", (user_id,))
     user = cursor.fetchone()
     conn.close()
-    
+
     if user:
         return jsonify({
-            'id': user[0],
-            'username': user[1],
-            'role': user[3]
+            "id": user["id"],
+            "username": user["username"],
+            "role": user["role"],
         })
-    return jsonify({'error': 'Usuário não encontrado'}), 404
 
-@app.route('/debug')
-def debug_info():
+    return jsonify({"error": "Usuario nao encontrado"}), 404
 
-    return jsonify({
-        'secret_key': SECRET_KEY,
-        'python_version': '3.9',
-        'debug_mode': True
-    })
 
-if __name__ == '__main__':
-
+if __name__ == "__main__":
     init_db()
-    
-    app.run(host='0.0.0.0', port=5000, debug=True)
+
+    # Ensure Flask/Werkzeug does not leak server/version details.
+    WSGIRequestHandler.server_version = "Server"
+    WSGIRequestHandler.sys_version = ""
+
+    app.run(host="127.0.0.1", port=5000, debug=False)
