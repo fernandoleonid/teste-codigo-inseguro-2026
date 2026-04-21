@@ -1,0 +1,96 @@
+name: Security Pipeline (SAST → DAST)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  sast:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      - name: Executar Bandit (SAST)
+        run: |
+          bandit -r . -x ./.venv,./venv,./env,./__pycache__ -f json -o bandit-report.json
+          bandit -r . -x ./.venv,./venv,./env,./__pycache__ -f custom --msg-template '{relpath}:{line}: {test_id}[{severity}]: {msg}'
+
+      - name: "Quality Gate: Falhar se houver vulnerabilidades CRÍTICAS ou ALTAS"
+        run: |
+          if grep -qE '"severity": "(HIGH|CRITICAL)"' bandit-report.json; then
+            echo "❌ Vulnerabilidades críticas/altas detectadas pelo Bandit!"
+            echo "💡 Corrija os alertas e faça push novamente."
+            exit 1
+          fi
+          echo "✅ SAST passou: sem vulnerabilidades críticas ou altas."
+
+      - name: Salvar relatório do Bandit
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-report
+          path: bandit-report.json
+          retention-days: 7
+
+  dast:
+    needs: sast
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependências da aplicação
+        run: pip install -r requirements.txt
+
+      - name: Subir aplicação em staging (background)
+        run: |
+          python app_inseguro.py > app.log 2>&1 &
+          APP_PID=$!
+          echo "APP_PID=$APP_PID" >> $GITHUB_ENV
+          echo "⏳ Aguardando aplicação iniciar..."
+          for i in {1..30}; do
+            curl -s http://localhost:5000 > /dev/null && break
+            sleep 1
+          done
+          if ! curl -s http://localhost:5000 > /dev/null; then
+            echo "❌ Aplicação não respondeu em localhost:5000"
+            cat app.log
+            exit 1
+          fi
+          echo "✅ Aplicação disponível em http://localhost:5000"
+
+      - name: OWASP ZAP Baseline Scan (DAST)
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: 'http://localhost:5000'
+          cmd_options: '-I -r zap-report.html'
+
+      - name: Salvar relatório do ZAP
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report
+          path: zap-report.html
+          retention-days: 7
+
+      - name: Parar aplicação (cleanup)
+        if: always()
+        run: |
+          if [ -n "$APP_PID" ]; then
+            kill $APP_PID 2>/dev/null || true
+            echo "✅ Aplicação encerrada (PID: $APP_PID)"
+          fi
